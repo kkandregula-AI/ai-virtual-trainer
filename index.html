@@ -395,30 +395,62 @@ body{
 .bvf.dng{background:var(--red-dim);border:1px solid var(--red);color:var(--red);}
 
 /* ── RESPONSIVE: Mobile ── */
+/* Panel tabs always visible — outside flex flow, not inside .mb */
+.panel-tabs{
+  display:none; /* shown via JS class on #app */
+  background:var(--s1);
+  border-top:1px solid var(--border);
+  flex-shrink:0;
+  position:fixed;
+  bottom:0;left:0;right:0;
+  z-index:200;
+  padding-bottom:var(--safe-bot);
+}
 @media(max-width:700px){
-  /* hide 3-panel, show tabs */
+  .panel-tabs{display:block;}
   .zc{display:none !important;}
   .zs{width:100% !important;border-right:none !important;}
-  .mb{position:relative;}
-  .panel{position:absolute;inset:0;transition:opacity .2s;}
+  /* .mb must fill remaining height — voice bar is inside .zt panel */
+  .mb{
+    position:relative;
+    flex:1;
+    overflow:hidden;
+  }
+  .panel{
+    position:absolute;
+    inset:0;
+    transition:opacity .15s;
+    overflow:hidden;
+  }
   .panel.hidden{opacity:0;pointer-events:none;z-index:0;}
   .panel.visible{opacity:1;pointer-events:all;z-index:1;}
-  .panel-tabs{display:block;}
-  /* Show content panel on its own tab */
+  /* Content panel on mobile tab */
   .zc-mobile{display:flex !important;position:absolute;inset:0;background:var(--s1);}
-  /* Voice bar adapts */
-  .vbar{padding-bottom:calc(9px + var(--safe-bot));}
+  /* Add bottom padding on trainer panel so voice bar doesn't hide behind tab bar */
+  #panel-trainer .vbar{padding-bottom:calc(56px + var(--safe-bot));}
+  /* Add bottom padding on slide panel so nav doesn't hide behind tab bar */
+  #panel-slide .nav{padding-bottom:calc(10px + var(--safe-bot));}
 }
 
-/* Desktop: hide tabs, show all panels */
+/* Desktop: hide tabs, show all panels side by side */
 @media(min-width:701px){
-  .panel-tabs{display:none;}
-  .panel{position:relative;opacity:1 !important;pointer-events:all !important;}
+  .panel-tabs{display:none !important;}
+  .panel{position:relative;opacity:1 !important;pointer-events:all !important;display:flex !important;}
   .zs{display:flex !important;}
   .zc{display:flex !important;}
   .zt{display:flex !important;}
   .zc-mobile{display:none !important;}
 }
+
+/* Accent filter tabs */
+.accent-tab{
+  background:var(--card);border:1px solid var(--border);color:var(--muted);
+  padding:2px 7px;border-radius:6px;font-family:'Plus Jakarta Sans',sans-serif;
+  font-size:.6rem;font-weight:600;cursor:pointer;transition:.15s;
+  -webkit-user-select:none;
+}
+.accent-tab.active{background:var(--teal-dim);border-color:var(--teal);color:var(--teal);}
+.accent-tab:active{transform:scale(.95);}
 </style>
 </head>
 <body>
@@ -600,8 +632,14 @@ body{
             <span class="ve-label" id="ve-label">🔊 System</span>
             <span class="ve-change">Change</span>
           </div>
-          <div class="vg" id="vsysrow">
-            <select id="vsel" onchange="onVC()"></select>
+          <div class="vg" id="vsysrow" style="flex-direction:column;gap:3px;align-items:flex-start">
+            <div style="display:flex;gap:4px;flex-wrap:wrap" id="accent-tabs">
+              <button class="accent-tab active" data-accent="all" onclick="filterVoiceAccent('all',this)">All</button>
+              <button class="accent-tab" data-accent="in" onclick="filterVoiceAccent('in',this)">🇮🇳 Indian</button>
+              <button class="accent-tab" data-accent="uk" onclick="filterVoiceAccent('uk',this)">🇬🇧 British</button>
+              <button class="accent-tab" data-accent="us" onclick="filterVoiceAccent('us',this)">🇺🇸 American</button>
+            </div>
+            <select id="vsel" onchange="onVC()" style="width:100%"></select>
           </div>
           <div class="vg" style="min-width:95px">
             <label>⚡</label>
@@ -782,6 +820,9 @@ let mRec=null,aChunks=[],recSecs=0,recTmr=null,recBlob=null;
 let pbAudio=null,isPB=false,acx=null,anlsr=null,mStream=null;
 // Mobile panel state
 let activeMobilePanel='slide';
+// Background fetch tracking
+let claudeFetchInProgress={};
+let teachOpenerIdx=0;
 
 // ══════════════════════════════════════════════
 //  STARTUP
@@ -1086,139 +1127,200 @@ async function extractPDFLines(n){
 }
 
 // ══════════════════════════════════════════════
-//  SINGLE API CALL — gets lines + teacher explanations in one shot
-//  Works for both PDF (image) and text-based files
+//  SLIDE DATA ENGINE
+//  Strategy: teach immediately with plain text,
+//  then enrich with Claude explanations in background
 // ══════════════════════════════════════════════
+
+
 async function getSlideData(n){
   if(lineCache[n])return lineCache[n];
   const slide=slides[n-1];
   if(!slide)return{title:'Slide '+n,lines:[],points:[]};
 
+  // ── INSTANT: build from slide text immediately (zero wait) ──
+  const rawLines=(slide.content||'').split('\n')
+    .map(l=>l.replace(/^[-*•#>]+\s*/,'').trim())
+    .filter(l=>l.length>4&&l!==slide.title)
+    .slice(0,12);
+
+  const instant={
+    title:slide.title||'Slide '+n,
+    lines:rawLines,
+    points:rawLines.map(l=>({line:l,extension:''})),
+    ready:false  // Claude hasn't enriched yet
+  };
+  lineCache[n]=instant;
+
+  // ── ASYNC: fetch rich explanations from Claude in background ──
+  if(!claudeFetchInProgress[n]){
+    claudeFetchInProgress[n]=true;
+    fetchSlideExplanations(n,slide,instant).then(enriched=>{
+      lineCache[n]=enriched;
+      // If we're currently on this slide, refresh the content panel
+      if(curPg===n&&lineTeaching===false){
+        slideLines=enriched.lines.map(l=>({text:l,status:'pending'}));
+        renderContentLines(enriched.title,slideLines);
+      }
+    }).catch(e=>console.warn('Background Claude fetch failed slide '+n+':',e));
+  }
+
+  return instant;
+}
+
+// Fetch rich Claude explanations — called in background
+async function fetchSlideExplanations(n,slide,instant){
   const img=imgCache[n]||slide.image;
   const textContent=slide.content||'';
 
-  // Show PDF lines immediately while API loads (for PDF files)
-  if(slide.type==='pdf'&&!img){
-    const r={title:slide.title||'Slide '+n,lines:slide.content.split('\n').filter(l=>l.length>2),points:[]};
-    lineCache[n]=r;return r;
-  }
+  // Build a varied, context-aware prompt
+  const pointCount=instant.lines.length;
+  let userContent;
 
-  try{
-    // Build the user message — image for PDF, text for other types
-    let userContent;
-    if(img){
-      userContent=[
-        {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
-        {type:'text',text:`You are an expert classroom teacher. Study this training slide carefully.
+  if(img){
+    userContent=[
+      {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
+      {type:'text',text:`You are a lively, engaging classroom teacher. Look at this training slide.
 
-Return ONLY a JSON object — no markdown, no explanation, just raw JSON:
-{"title":"the main heading","points":[{"line":"exact text of point 1","extension":"Your teacher explanation: start by restating the point simply, then explain WHY it matters in the real world, then give one concrete everyday example. 2-3 sentences, warm tone."},{"line":"exact text of point 2","extension":"teacher explanation..."}]}
+Your job: For each point on the slide, write a SHORT teacher explanation (2 sentences max) that ADDS VALUE beyond what is written.
 
-IMPORTANT: In the extension, DO NOT just repeat the slide text. EXPLAIN it — add meaning, context, and a real example. The student is reading the slide — they need you to help them understand it.`}
-      ];
-    }else{
-      // Text-based file — send content directly
-      userContent=[{type:'text',text:`You are an expert classroom teacher. Here is the content for slide ${n}:
+Rules for each explanation:
+- NEVER start with "This point..." or "This means..." — vary your openings
+- Use phrases like: "Think of it this way —", "In practice,", "Here's why this matters:", "A simple example:", "The key insight here is", "Imagine you're...", "In real life,", "Simply put,"
+- The explanation must ADD something the slide doesn't say — an example, a reason, a consequence, an analogy
+- Each explanation should feel DIFFERENT from the others — don't repeat sentence patterns
+- Keep it conversational and warm
 
-SLIDE TITLE: ${slide.title}
-CONTENT:
-${textContent.substring(0,1200)}
-
-Return ONLY a JSON object — no markdown, no explanation, just raw JSON:
-{"title":"${slide.title.replace(/"/g,"'")}","points":[{"line":"key point 1 extracted from the content","extension":"Your teacher explanation: explain WHY this matters, give a real-world example, relate it to something familiar. 2-3 sentences, warm conversational tone. DO NOT just repeat the point — add insight."},{"line":"key point 2","extension":"teacher explanation..."}]}
-
-Extract the 3-6 most important learning points from the content. For each, write a genuine teacher explanation that adds understanding beyond what is written.`}];
-    }
-
-    const text=await callClaude(
-      [{role:'user',content:userContent}],
-      'You are a JSON generator and teaching expert. Return ONLY valid JSON. Extensions must genuinely explain and add insight — not repeat the slide text verbatim.',
-      1400
-    );
-
-    // Robust JSON parsing
-    let obj=null;
-    const parsers=[
-      ()=>JSON.parse(text),
-      ()=>JSON.parse(text.replace(/```json|```/gi,'').trim()),
-      ()=>{const m=text.match(/\{[\s\S]*\}/);return m?JSON.parse(m[0]):null;},
-      ()=>{
-        const pts=[];
-        const lMs=[...text.matchAll(/"line"\s*:\s*"([^"]+)"/g)];
-        const eMs=[...text.matchAll(/"extension"\s*:\s*"([^"]+)"/g)];
-        lMs.forEach((m,i)=>pts.push({line:m[1],extension:eMs[i]?.[1]||''}));
-        const tM=text.match(/"title"\s*:\s*"([^"]+)"/);
-        return pts.length?{title:tM?.[1]||slide.title,points:pts}:null;
-      }
+Return ONLY this JSON (no markdown, no explanation):
+{"title":"slide title","points":[{"line":"exact text of point","extension":"your 1-2 sentence teacher addition"},...]}`}
     ];
-    for(const p of parsers){try{const r=p();if(r?.points?.length){obj=r;break;}}catch(e){}}
+  }else{
+    userContent=[{type:'text',text:`You are a lively, engaging classroom teacher. Here is the content of one training slide:
 
-    if(obj?.points?.length){
-      const result={
-        title:obj.title||slide.title||'Slide '+n,
-        lines:obj.points.map(p=>p.line).filter(l=>l&&l.length>2),
-        points:obj.points.filter(p=>p.line&&p.line.length>2)
-      };
-      // Save to session notes + extension cache immediately
-      if(!sessionNotes[n])sessionNotes[n]={title:result.title,points:[],fullExpl:'',timestamp:new Date().toISOString()};
-      sessionNotes[n].title=result.title;
-      sessionNotes[n].points=result.points.map(p=>({line:p.line,extension:p.extension}));
-      result.points.forEach(p=>{lineExtCache[n+'::'+p.line]=p.extension||'';});
-      lineCache[n]=result;
-      return result;
-    }
-    throw new Error('JSON parse failed');
+TITLE: ${slide.title}
+CONTENT:
+${textContent.substring(0,1000)}
 
-  }catch(e){
-    console.warn('getSlideData failed, using content fallback:',e.message);
-    // Fallback: use the slide content lines as-is
-    const lines=(slide.content||'').split('\n')
-      .map(l=>l.replace(/^[-*•#]+\s*/,'').trim())
-      .filter(l=>l.length>5)
-      .slice(0,10);
-    const result={title:slide.title||'Slide '+n,lines,points:lines.map(l=>({line:l,extension:''}))};
-    lineCache[n]=result;
-    if(!sessionNotes[n])sessionNotes[n]={title:result.title,points:[],fullExpl:'',timestamp:new Date().toISOString()};
-    return result;
+Extract the 4-8 most important teaching points and for each write a SHORT explanation (2 sentences) that ADDS VALUE.
+
+Rules:
+- NEVER start with "This point..." or "This means..." — vary your openings
+- Use phrases like: "Think of it this way —", "In practice,", "A simple example:", "The key insight is", "Imagine you're...", "In real life,"
+- Each explanation must feel DIFFERENT — no repeated sentence patterns
+- Add something the slide doesn't say — an example, analogy, or consequence
+- Warm, conversational, like talking to a student
+
+Return ONLY this JSON:
+{"title":"${slide.title.replace(/"/g,"'")}","points":[{"line":"key point extracted","extension":"your 1-2 sentence addition"},...]}`}];
   }
+
+  const text=await callClaude(
+    [{role:'user',content:userContent}],
+    'JSON generator. Return ONLY valid JSON. Each extension must start differently — never "This point" or "This means". Add genuine value beyond the slide text.',
+    1400
+  );
+
+  // Parse JSON
+  let obj=null;
+  const parsers=[
+    ()=>JSON.parse(text),
+    ()=>JSON.parse(text.replace(/```json|```/gi,'').trim()),
+    ()=>{const m=text.match(/\{[\s\S]*\}/);return m?JSON.parse(m[0]):null;},
+    ()=>{
+      const lMs=[...text.matchAll(/"line"\s*:\s*"([^"]+)"/g)];
+      const eMs=[...text.matchAll(/"extension"\s*:\s*"([^"]+)"/g)];
+      const pts=lMs.map((m,i)=>({line:m[1],extension:eMs[i]?.[1]||''}));
+      const tM=text.match(/"title"\s*:\s*"([^"]+)"/);
+      return pts.length?{title:tM?.[1]||slide.title,points:pts}:null;
+    }
+  ];
+  for(const p of parsers){try{const r=p();if(r?.points?.length){obj=r;break;}}catch(e){}}
+
+  if(!obj?.points?.length)return instant; // fall back to plain text
+
+  const result={
+    title:obj.title||slide.title||'Slide '+n,
+    lines:obj.points.map(p=>p.line).filter(l=>l&&l.length>2),
+    points:obj.points.filter(p=>p.line&&p.line.length>2),
+    ready:true
+  };
+
+  // Cache extensions + session notes
+  if(!sessionNotes[n])sessionNotes[n]={title:result.title,points:[],fullExpl:'',timestamp:new Date().toISOString()};
+  sessionNotes[n].title=result.title;
+  sessionNotes[n].points=result.points.map(p=>({line:p.line,extension:p.extension}));
+  result.points.forEach(p=>{lineExtCache[n+'::'+p.line]=p.extension||'';});
+
+  return result;
 }
 
 // Thin wrappers
 async function getSlideLines(n){const d=await getSlideData(n);return{title:d.title,lines:d.lines};}
 
+// Teaching style openers — rotated to avoid repetition
+const TEACH_OPENERS=[
+  'Think of it this way —','In practice,','Here's why this matters:',
+  'A helpful way to see this:','In real life,','Simply put,',
+  'The key insight here is','Picture this scenario:','What this really means is',
+  'To put it in context,','Here's a concrete example:','What most people miss is that'
+];
+let teachOpenerIdx=0;
+function nextOpener(){return TEACH_OPENERS[teachOpenerIdx++%TEACH_OPENERS.length];}
+
 async function getLineExtension(n,lineText,slideTitle){
   const key=n+'::'+lineText;
-  if(lineExtCache[key]!==undefined&&lineExtCache[key]!==''){
-    // Already cached from getSlideData — just ensure session notes are updated
+
+  // If Claude background fetch has already returned a rich extension — use it
+  if(lineExtCache[key]!==undefined&&lineExtCache[key].length>15){
     if(!sessionNotes[n])sessionNotes[n]={title:slideTitle,points:[],fullExpl:'',timestamp:new Date().toISOString()};
     const existing=sessionNotes[n].points.find(p=>p.line===lineText);
     if(!existing)sessionNotes[n].points.push({line:lineText,extension:lineExtCache[key]});
     return lineExtCache[key];
   }
-  // Missing from cache — generate for this point only
-  setStag('thinking','✦ Preparing…');
-  const slide=slides[n-1];
-  const img=imgCache[n]||slide?.image;
-  try{
-    let userMsg;
-    if(img){
-      userMsg=[
-        {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
-        {type:'text',text:'As a classroom teacher, explain this point from the slide in 2-3 warm spoken sentences: "'+lineText+'". Explain what it MEANS simply, WHY it matters, and give one real-life example. Do not just repeat the text — add genuine understanding.'}
-      ];
-    }else{
-      userMsg=[{type:'text',text:'As a classroom teacher, explain this training point in 2-3 warm spoken sentences: "'+lineText+'". Explain what it means simply, why it matters, one real-life example. Do not just repeat the text.'}];
+
+  // Check if background Claude fetch is still running — wait up to 6s for it
+  if(claudeFetchInProgress[n]){
+    setStag('thinking','✦ Loading explanation…');
+    const waited=await waitForCache(key,6000);
+    if(waited&&lineExtCache[key]&&lineExtCache[key].length>15){
+      if(!sessionNotes[n])sessionNotes[n]={title:slideTitle,points:[],fullExpl:'',timestamp:new Date().toISOString()};
+      const existing=sessionNotes[n].points.find(p=>p.line===lineText);
+      if(!existing)sessionNotes[n].points.push({line:lineText,extension:lineExtCache[key]});
+      return lineExtCache[key];
     }
-    const text=await callClaude([{role:'user',content:userMsg}],'Warm classroom teacher. 2-3 natural spoken sentences. Add genuine explanation, not just repetition.',400);
-    lineExtCache[key]=text;
-    if(!sessionNotes[n])sessionNotes[n]={title:slideTitle,points:[],fullExpl:'',timestamp:new Date().toISOString()};
-    const existing=sessionNotes[n].points.find(p=>p.line===lineText);
-    if(existing)existing.extension=text;else sessionNotes[n].points.push({line:lineText,extension:text});
-    return text;
-  }catch(e){
-    const fb='This point tells us about '+lineText.substring(0,40)+'. Let us think about what this means in practice and why it matters in our work or daily life.';
-    lineExtCache[key]=fb;return fb;
   }
+
+  // Immediate fallback — make a varied, useful sentence without API
+  const opener=nextOpener();
+  const words=lineText.toLowerCase();
+  let fb='';
+  if(words.includes('important')||words.includes('key')||words.includes('critical'))
+    fb=opener+' this is something every professional should know — it directly affects the quality of your work and decisions you make every day.';
+  else if(words.includes('process')||words.includes('step')||words.includes('method'))
+    fb=opener+' following this process helps ensure consistent, reliable results — it removes guesswork and makes the outcome predictable.';
+  else if(words.includes('data')||words.includes('measure')||words.includes('metric'))
+    fb=opener+' numbers give us objective evidence rather than just opinion — without measuring, we cannot know if something is actually working.';
+  else if(words.includes('team')||words.includes('collaborat')||words.includes('people'))
+    fb=opener+' working together effectively multiplies what any individual can achieve alone — the right collaboration always produces better outcomes.';
+  else
+    fb=opener+' understanding this concept will make a real difference in how you approach your work. Take a moment to connect it to something you already know.';
+
+  lineExtCache[key]=fb;
+  if(!sessionNotes[n])sessionNotes[n]={title:slideTitle,points:[],fullExpl:'',timestamp:new Date().toISOString()};
+  const existing=sessionNotes[n].points.find(p=>p.line===lineText);
+  if(existing)existing.extension=fb;else sessionNotes[n].points.push({line:lineText,extension:fb});
+  return fb;
+}
+
+// Wait up to `ms` for a cache key to be populated
+function waitForCache(key,ms){
+  return new Promise(resolve=>{
+    const t0=Date.now();
+    const check=setInterval(()=>{
+      if(lineExtCache[key]&&lineExtCache[key].length>15){clearInterval(check);resolve(true);}
+      else if(Date.now()-t0>ms){clearInterval(check);resolve(false);}
+    },200);
+  });
 }
 
 // ══════════════════════════════════════════════
@@ -1226,6 +1328,9 @@ async function getLineExtension(n,lineText,slideTitle){
 // ══════════════════════════════════════════════
 async function getFullExpl(n){
   if(explCache[n])return explCache[n];
+  // Instant fallback while Claude loads
+  const slide=slides[n-1];
+  const instFallback=slide?`Let's look at ${slide.type==='text'?'section':'slide'} ${n} — "${slide.title}". ${slide.content?.split('\n').filter(l=>l.trim().length>5).slice(0,3).join(' ')||''}`.trim():'Loading…';
   setStag('thinking','✦ AI reading slide…');
   const slide=slides[n-1];
   const img=imgCache[n]||slide?.image;
@@ -1287,25 +1392,31 @@ async function goSlide(n,autoStart=true){
   await renderSlide(n);
 
   if(teachMode==='line'){
-    // Show content immediately from slides[] (no extra API call needed)
+    // Show content IMMEDIATELY from slide text — zero API wait
     const slideNow=slides[n-1];
-    if(slideNow&&slideNow.content){
-      const rawLines=slideNow.content.split('\n')
-        .map(l=>l.replace(/^[-*•#]+\s*/,'').trim()).filter(l=>l.length>3).slice(0,10);
-      if(rawLines.length)renderContentLines(slideNow.title,rawLines.map(l=>({text:l,status:'pending'})));
-    }
-    setStag('thinking','✦ Preparing slide…');
-    document.getElementById('tsub').textContent='Loading content…';
-
-    // Now load full slide data (1 API call)
-    const data=await getSlideData(n);
+    const data=await getSlideData(n); // instant — returns plain text immediately, Claude loads async
     if(data.lines&&data.lines.length>0){
       slideLines=data.lines.map(l=>({text:l,status:'pending'}));
       renderContentLines(data.title,slideLines);
       setStag('ready','Ready');
       if(autoStart)startLineTeaching();
+    }else if(slideNow&&slideNow.content){
+      // Edge case: no lines parsed — render raw content
+      const rawLines=slideNow.content.split('
+')
+        .map(l=>l.replace(/^[-*•#]+\s*/,'').trim()).filter(l=>l.length>3).slice(0,10);
+      if(rawLines.length){
+        slideLines=rawLines.map(l=>({text:l,status:'pending'}));
+        renderContentLines(slideNow.title,slideLines);
+        setStag('ready','Ready');
+        if(autoStart)startLineTeaching();
+      }else{
+        const expl=await getFullExpl(n);
+        renderFullExpl(expl);
+        setStag('ready','Ready');
+        if(autoStart)speakText(expl,()=>onSlideEnd());
+      }
     }else{
-      renderContentLines(data.title,[]);
       const expl=await getFullExpl(n);
       renderFullExpl(expl);
       setStag('ready','Ready');
@@ -1364,7 +1475,9 @@ async function teachLine(idx){
   scrollToLine(idx);
   const ext=await getLineExtension(curPg,slideLines[idx].text,lineCache[curPg]?.title||'Slide '+curPg);
   document.getElementById('ext-note').style.display='block';
-  document.getElementById('en-text').textContent=ext;
+  // Show extension — if blank (background fetch pending), show loading state
+  const extText=ext||'Preparing extended explanation…';
+  document.getElementById('en-text').textContent=extText;
   setStag('teaching','🔊 Teaching…');
   speakText(slideLines[idx].text+'. '+ext,()=>{
     slideLines[idx].status='taught';curLineIdx=idx+1;
@@ -1766,22 +1879,94 @@ function clearTrainer(){
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // ══════════════════════════════════════════════
-//  VOICES
+//  VOICES — English incl. Indian English (en-IN)
 // ══════════════════════════════════════════════
+let allEnVoices=[];
+let curAccent='all';
+
 function populateVoices(){
-  const vs=speechSynthesis.getVoices().filter(v=>v.lang.startsWith('en'));
-  const sel=document.getElementById('vsel');sel.innerHTML='';
-  vs.forEach((v,i)=>{const o=document.createElement('option');o.value=i;o.textContent=v.name;sel.appendChild(o);});
-  const p=vs.findIndex(v=>['samantha','daniel','karen','moira','google uk','google us','zira'].some(k=>v.name.toLowerCase().includes(k)));
-  sel.value=p>=0?p:0;selVoice=vs[sel.value]||vs[0];
+  // Collect ALL English voices including en-IN
+  allEnVoices=speechSynthesis.getVoices().filter(v=>
+    v.lang.startsWith('en')||v.lang==='en-IN'||v.name.toLowerCase().includes('hindi')||v.name.toLowerCase().includes('india')
+  );
+  // Remove duplicates by name
+  const seen=new Set();
+  allEnVoices=allEnVoices.filter(v=>{if(seen.has(v.name))return false;seen.add(v.name);return true;});
+  filterVoiceAccent(curAccent,null);
 }
+
+function filterVoiceAccent(accent,btnEl){
+  curAccent=accent;
+  // Update tab button styles
+  document.querySelectorAll('.accent-tab').forEach(b=>{
+    b.classList.toggle('active',b.dataset.accent===accent);
+  });
+  let filtered;
+  if(accent==='in'){
+    filtered=allEnVoices.filter(v=>
+      v.lang==='en-IN'||
+      v.name.toLowerCase().includes('india')||
+      v.name.toLowerCase().includes('ravi')||
+      v.name.toLowerCase().includes('lekha')||
+      v.name.toLowerCase().includes('kanya')||
+      v.name.toLowerCase().includes('mohan')||
+      v.name.toLowerCase().includes('veena')
+    );
+    // If device has no Indian voice, fallback to all + note
+    if(!filtered.length){
+      filtered=allEnVoices;
+      const note=document.createElement('option');
+      note.disabled=true;note.textContent='No Indian voices on this device — showing all';
+      document.getElementById('vsel').prepend(note);
+    }
+  }else if(accent==='uk'){
+    filtered=allEnVoices.filter(v=>
+      v.lang==='en-GB'||
+      ['daniel','kate','serena','oliver','moira'].some(k=>v.name.toLowerCase().includes(k))
+    );
+    if(!filtered.length)filtered=allEnVoices;
+  }else if(accent==='us'){
+    filtered=allEnVoices.filter(v=>
+      v.lang==='en-US'||
+      ['samantha','alex','zira','david','google us'].some(k=>v.name.toLowerCase().includes(k))
+    );
+    if(!filtered.length)filtered=allEnVoices;
+  }else{
+    filtered=allEnVoices;
+  }
+
+  const sel=document.getElementById('vsel');
+  sel.innerHTML='';
+  filtered.forEach((v,i)=>{
+    const o=document.createElement('option');
+    o.value=allEnVoices.indexOf(v); // value = index in allEnVoices
+    const lang=v.lang||'';
+    const flag=lang==='en-IN'?'🇮🇳 ':lang.startsWith('en-GB')?'🇬🇧 ':lang.startsWith('en-US')?'🇺🇸 ':lang.startsWith('en-AU')?'🇦🇺 ':'';
+    o.textContent=flag+v.name;
+    sel.appendChild(o);
+  });
+
+  // Pick a good default
+  const preferred=['lekha','ravi','kanya','veena','mohan','samantha','daniel','karen','google uk','zira'];
+  let best=filtered.findIndex(v=>preferred.some(k=>v.name.toLowerCase().includes(k)));
+  if(best<0)best=0;
+  if(sel.options[best])sel.value=sel.options[best].value;
+  selVoice=allEnVoices[parseInt(sel.value||0)]||allEnVoices[0];
+}
+
 window.speechSynthesis.onvoiceschanged=populateVoices;
-function onVC(){const vs=speechSynthesis.getVoices().filter(v=>v.lang.startsWith('en'));selVoice=vs[parseInt(document.getElementById('vsel').value)];}
+populateVoices(); // immediate call (some browsers populate synchronously)
+
+function onVC(){
+  const sel=document.getElementById('vsel');
+  const idx=parseInt(sel.value);
+  selVoice=allEnVoices[idx]||allEnVoices[0];
+}
 function onSC(){spRate=parseFloat(document.getElementById('spdr').value);document.getElementById('spv').textContent=spRate.toFixed(1)+'×';}
 
 function resetApp(){
   stopAll();trainMode=false;slides=[];pdf=null;totalPgs=0;curPg=1;
-  explCache={};imgCache={};lineCache={};lineExtCache={};sessionNotes={};slideLines=[];
+  explCache={};imgCache={};lineCache={};lineExtCache={};sessionNotes={};slideLines=[];claudeFetchInProgress={};teachOpenerIdx=0;
   document.getElementById('upload-screen').style.display='flex';
   document.getElementById('app').style.display='none';
   document.getElementById('fi').value='';
