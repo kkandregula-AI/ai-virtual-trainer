@@ -428,7 +428,7 @@ body{
     <div class="prog"><div class="prog-f" id="prog-fill"></div></div>
     <span class="pct" id="prog-pct">0%</span>
     <div class="topbar-acts">
-      <button class="tbtn amber" id="notes-btn" onclick="openNotes()">📒 Notes</button>
+      <button class="tbtn amber" id="notes-btn" onclick="openNotes()" title="View and export session notes">📒 Notes</button>
       <button class="tbtn" onclick="resetApp()">↩ New</button>
     </div>
   </div>
@@ -538,8 +538,8 @@ body{
       <h2>Session Notes</h2>
       <div class="sheet-acts">
         <button class="sact gen" id="ai-notes-btn" onclick="generateAINotes()">✨ AI Notes</button>
-        <button class="sact pdf" onclick="exportPDF()">⬇ PDF</button>
-        <button class="sact copy" onclick="copyNotes()">📋</button>
+        <button class="sact pdf" onclick="exportPDF()" title="Download notes as PDF">⬇️ Export PDF</button>
+        <button class="sact copy" onclick="copyNotes()" title="Copy to clipboard">📋 Copy</button>
       </div>
       <button class="sheet-x" onclick="closeNotes()">✕</button>
     </div>
@@ -877,44 +877,83 @@ async function enrichSlide(n,slide,instant){
   const img=imgCache[n]||slide.image;
   const txt=slide.content||'';
   let userContent;
-  if(img){
-    userContent=[
-      {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
-      {type:'text',text:`You are an expert classroom teacher. Look at this slide carefully.
 
-For each point visible on the slide, write a SHORT teacher explanation (2 sentences max) that ADDS INSIGHT beyond what is written.
+  // The teacher script prompt — focus on what the teacher SAYS, not describing the point
+  const teacherPrompt=img?
+    `You are a lively, knowledgeable classroom teacher. You've just read this slide internally.
 
-VARY your sentence starters — use: "Think of it this way —", "In practice,", "Here's why this matters:", "A simple example:", "In real life,", "The key insight is", "Imagine you're…", "Simply put," — never "This point" or "This means".
+Now write what you would SAY OUT LOUD to your students for each point — as natural, engaging speech.
 
-Return ONLY valid JSON (no markdown):
-{"title":"slide title","points":[{"line":"exact point text","ext":"your 1-2 sentence teacher insight"},...]}`}
-    ];
-  }else{
-    userContent=[{type:'text',text:`You are an expert classroom teacher. Here is slide ${n} content:
+CRITICAL rules:
+- DO NOT read or repeat the slide text. The student can already see it.
+- Speak AS IF explaining to someone who doesn't know this topic yet
+- Give the "why", a relatable example, or a consequence — things NOT on the slide
+- Each explanation: 2 sentences of warm, varied speech
+- Headings/titles → mark type as "heading" (skip reading, just use for context)
+- Bullet points / key facts → mark type as "point"
+- NEVER start with "This point", "This means", "This refers to", "This is about"
+- Each sentence should START differently from the previous ones
+
+Return ONLY valid JSON:
+{"title":"slide title","points":[{"line":"exact text from slide","type":"heading|point","speech":"2 sentences the teacher would say to explain and add value"},...]}
+
+Be a real teacher — add examples, stories, consequences, analogies. Make it interesting.`
+    :
+    `You are a lively, knowledgeable classroom teacher. Here is slide ${n}:
 
 TITLE: ${slide.title}
 ${txt.substring(0,900)}
 
-Extract the 4-8 key learning points and for each write a SHORT explanation (2 sentences) that ADDS INSIGHT — not just repetition.
+For each key learning point, write 2 sentences of what you would SAY OUT LOUD to students.
 
-VARY sentence starters: "Think of it this way —", "In practice,", "Here's why:", "A simple example:", "In real life,", "The key insight is".
+CRITICAL rules:
+- Do NOT repeat what is written — add the "why", an example, or real-world consequence
+- Speak naturally: short sentences, active voice, direct to the student ("you", "imagine", "think about")
+- Each speech should START differently — no repeated openers
+- Skip headings (type:"heading") — they don't need explanation
+- NEVER say "This point says", "This means that", "This refers to"
 
 Return ONLY valid JSON:
-{"title":"${slide.title.replace(/"/g,"'")}","points":[{"line":"key point","ext":"2-sentence teacher insight"},...]}`}];
-  }
-  const raw=await callClaude([{role:'user',content:userContent}],'Return ONLY valid JSON. Vary sentence starters for each point. Add genuine insight, not just repetition.',1400);
+{"title":"${slide.title.replace(/"/g,"'")}","points":[{"line":"key point","type":"point","speech":"what teacher says out loud"},{"line":"another point","type":"point","speech":"what teacher says"},...]}`;
+
+  userContent=img?[
+    {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
+    {type:'text',text:teacherPrompt}
+  ]:[{type:'text',text:teacherPrompt}];
+
+  const raw=await callClaude([{role:'user',content:userContent}],
+    'You are a JSON generator for a classroom teacher app. Return ONLY valid JSON. The "speech" field is what the teacher says aloud — natural, engaging, adds value beyond the slide text. Never repeat the slide text verbatim.',
+    1600);
   let obj=null;
   for(const parse of[()=>JSON.parse(raw),()=>JSON.parse(raw.replace(/```json|```/gi,'').trim()),()=>{const m=raw.match(/\{[\s\S]*\}/);return m?JSON.parse(m[0]):null;}]){
     try{const r=parse();if(r?.points?.length){obj=r;break;}}catch(e){}
   }
   if(!obj?.points?.length)return instant;
-  const result={title:obj.title||slide.title,lines:obj.points.map(p=>p.line).filter(l=>l?.length>2),points:obj.points.filter(p=>p.line?.length>2),ready:true};
-  // Cache extensions
-  result.points.forEach(p=>{extCache[n+'::'+p.line]=p.ext||'';});
-  // Session notes
+
+  // Filter: keep only non-heading points that have real speech
+  const teachablePoints=obj.points.filter(p=>{
+    if(!p.line||p.line.length<3)return false;
+    if(p.type==='heading')return false; // headings skipped
+    return true;
+  });
+
+  // Build result — use "speech" field (new format) or fallback to "ext" (old format)
+  const result={
+    title:obj.title||slide.title,
+    lines:teachablePoints.map(p=>p.line),
+    points:teachablePoints.map(p=>({line:p.line,speech:p.speech||p.ext||''})),
+    ready:true
+  };
+
+  // Cache speech for each point
+  result.points.forEach(p=>{
+    extCache[n+'::'+p.line]=p.speech||'';
+  });
+
+  // Session notes — store line + speech
   if(!sessionNotes[n])sessionNotes[n]={title:result.title,points:[],fullExpl:'',ts:new Date().toISOString()};
   sessionNotes[n].title=result.title;
-  sessionNotes[n].points=result.points.map(p=>({line:p.line,ext:p.ext}));
+  sessionNotes[n].points=result.points.map(p=>({line:p.line,ext:p.speech}));
   return result;
 }
 
@@ -929,15 +968,30 @@ async function getExt(n,lineText,slideTitle){
     const got=await waitKey(key,5000);
     if(got&&extCache[key]&&extCache[key].length>15){ensureNotePoint(n,slideTitle,lineText,extCache[key]);return extCache[key];}
   }
-  // Instant varied fallback
+  // Instant varied fallback — context-aware, not generic
   const opener=OPENERS[openerIdx++%OPENERS.length];
   const w=lineText.toLowerCase();
   let fb='';
-  if(w.includes('process')||w.includes('step'))fb=opener+' following a clear process removes guesswork and makes results consistent and repeatable.';
-  else if(w.includes('data')||w.includes('metric')||w.includes('measure'))fb=opener+' numbers give us objective evidence — without measurement we cannot know if something is truly working.';
-  else if(w.includes('team')||w.includes('collaborat'))fb=opener+' working together multiplies what any individual can achieve — good collaboration always produces better outcomes.';
-  else if(w.includes('key')||w.includes('important')||w.includes('critical'))fb=opener+' this directly affects the quality of decisions you make every day — it is worth understanding deeply.';
-  else fb=opener+' connecting this idea to your own experience will make it stick. Think of a time when this mattered in your work or daily life.';
+  // Extract the core subject from the line for a more relevant response
+  const subject=lineText.split(/[,;]/)[0].trim().toLowerCase();
+  if(w.includes('process')||w.includes('workflow')||w.includes('procedure'))
+    fb=opener+` when you skip steps in a process, errors compound quickly. Building the habit of following it precisely is what separates professionals from beginners.`;
+  else if(w.includes('data')||w.includes('metric')||w.includes('analytic')||w.includes('measure'))
+    fb=opener+` decisions based on gut feeling often fail under scrutiny. Data gives you something concrete to point to — and to improve on systematically.`;
+  else if(w.includes('team')||w.includes('collaborat')||w.includes('communicat'))
+    fb=opener+` even the most capable individual hits a ceiling alone. Teams that communicate well consistently outperform those that don't, regardless of individual talent.`;
+  else if(w.includes('security')||w.includes('risk')||w.includes('threat')||w.includes('vulnerab'))
+    fb=opener+` a single overlooked vulnerability can compromise an entire system. This is why security can't be an afterthought — it has to be built in from day one.`;
+  else if(w.includes('test')||w.includes('quality')||w.includes('review')||w.includes('audit'))
+    fb=opener+` catching a problem early costs a fraction of fixing it in production. This is why teams that invest in review processes deliver far more reliable results.`;
+  else if(w.includes('design')||w.includes('architect')||w.includes('structur')||w.includes('pattern'))
+    fb=opener+` good design decisions compound over time — bad ones create technical debt that slows everything down. Getting it right early is always worth the investment.`;
+  else if(w.includes('user')||w.includes('customer')||w.includes('client'))
+    fb=opener+` every feature or process should be traced back to a real user need. If you can't articulate who benefits and how, it's worth questioning whether it belongs.`;
+  else if(w.includes('deploy')||w.includes('release')||w.includes('launch')||w.includes('production'))
+    fb=opener+` many projects succeed in testing but fail in production because the real environment is always more complex. Preparing for that gap is a core engineering discipline.`;
+  else
+    fb=opener+` ask yourself: if this concept didn't exist, what problem would immediately appear? That question reveals why it was created in the first place and why it matters.`;
   extCache[key]=fb;
   ensureNotePoint(n,slideTitle,lineText,fb);
   return fb;
@@ -965,9 +1019,10 @@ async function getFullExpl(n){
   const img=imgCache[n]||slide?.image;
   try{
     let uc;
-    if(img){uc=[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},{type:'text',text:`Slide ${n} of ${totalPgs}. You are a warm classroom teacher. Explain ALL content on this slide. Start with what the slide is about, then explain each point: what it means simply, why it matters, give a real example. End with a one-sentence summary. Natural speech, 220-260 words, no bullet points.`}];}
-    else{uc=[{type:'text',text:`Slide ${n} of ${totalPgs}. Content: ${(slide?.content||'').substring(0,900)}\n\nAs a warm classroom teacher, explain this content clearly. Cover each key idea: what it means simply, why it matters, one real-world example. End with a one-sentence summary. Natural speech, 220-260 words.`}];}
-    const txt=await callClaude([{role:'user',content:uc}],'Enthusiastic classroom teacher. Natural flowing speech, no bullet points, no markdown.',1000);
+    const teachSys='You are an enthusiastic, knowledgeable classroom teacher. Speak directly to students as if in a real class. NEVER just read the slide — add insight, examples, analogies, consequences. Use "you", "think about", "imagine". Vary your sentence structure. No bullet points, no markdown, natural conversational speech only.';
+    if(img){uc=[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},{type:'text',text:`This is slide ${n} of ${totalPgs}. You've read it internally. Now teach its content to students as you would in a live class:\n- Start: one sentence on what this slide is about\n- For each key point: explain WHY it matters, give a relatable example, add something NOT on the slide\n- End with a brief summary or bridge to the next topic\nSpeak naturally, 220-260 words. Sound like a real teacher — engaged, clear, human.`}];}
+    else{uc=[{type:'text',text:`Slide ${n} of ${totalPgs}.\n\n${(slide?.content||'').substring(0,900)}\n\nTeach this content to students as you would in a live class:\n- Start: one sentence on what this section is about\n- For each key idea: explain WHY it matters, give a relatable example, add insight beyond the text\n- End with a brief summary\nNatural conversational speech, 220-260 words. Sound like a real engaged teacher.`}];}
+    const txt=await callClaude([{role:'user',content:uc}],teachSys,1000);
     explCache[n]=txt;
     if(!sessionNotes[n])sessionNotes[n]={title:slide?.title||'Slide '+n,points:[],fullExpl:txt,ts:new Date().toISOString()};
     else sessionNotes[n].fullExpl=txt;
@@ -1020,7 +1075,30 @@ function setMode(m){
 // ═══════════════════════════════════════════════════════
 async function startLineTeach(){
   if(!slideLines.length){const e=await getFullExpl(curPg);showExpl(e);speakText(e,onSlideEnd);return;}
-  lineTeaching=true;lineIdx=0;await teachLine(0);
+  lineTeaching=true;lineIdx=0;
+
+  // Brief slide intro — trainer says what the slide is about, then teaches line by line
+  const slideData=lineCache[curPg];
+  const title=slideData?.title||slides[curPg-1]?.title||'';
+  if(title&&title.length>3){
+    const intro=buildSlideIntro(title,curPg,totalPgs);
+    document.getElementById('explain-text').textContent=intro;
+    await new Promise(res=>speakText(intro,res));
+    if(!lineTeaching)return; // stopped by user
+  }
+  await teachLine(0);
+}
+
+// Build a natural intro sentence — what a real teacher says when turning to a new slide
+function buildSlideIntro(title,n,total){
+  const intros=[
+    `Alright, slide ${n} is about "${title}". Let me walk you through this.`,
+    `Good — now we come to "${title}". This is an important one.`,
+    `Moving on — slide ${n} covers "${title}". Let's look at this together.`,
+    `Now, slide ${n}: "${title}". Pay close attention here.`,
+    `Right, so on this slide we have "${title}". Let me explain what this means.`,
+  ];
+  return intros[(n-1)%intros.length];
 }
 async function teachLine(i){
   if(!lineTeaching||i>=slideLines.length){
@@ -1036,26 +1114,61 @@ async function teachLine(i){
     return;
   }
   lineIdx=i;
+
+  // Skip heading-type lines — show them in content panel but don't explain them
+  if(isHeadingLine(slideLines[i].txt)){
+    slideLines[i].st='taught'; // mark as done without speaking
+    renderLines(lineCache[curPg]?.title||'Slide '+curPg,slideLines);
+    if(lineTeaching)setTimeout(()=>teachLine(i+1),100);
+    return;
+  }
+
   slideLines[i].st='active';
   renderLines(lineCache[curPg]?.title||'Slide '+curPg,slideLines);
   updateLPDots();
   document.getElementById('curr-pt').style.display='block';
-  document.getElementById('curr-txt').textContent=slideLines[i].txt;
+  // Show clean text (strip bullets/numbers) in the "Teaching this point" banner
+  document.getElementById('curr-txt').textContent=cleanForSpeech(slideLines[i].txt);
   document.getElementById('ext-box').style.display='none';
   document.getElementById('explain-text').innerHTML='';
   setStatus('thinking','✦ Preparing…');
   document.getElementById('trainer-sub').textContent='Point '+(i+1)+'/'+slideLines.length;
   scrollToLine(i);
-  const ext=await getExt(curPg,slideLines[i].txt,lineCache[curPg]?.title||'Slide '+curPg);
+  const speech=await getExt(curPg,slideLines[i].txt,lineCache[curPg]?.title||'Slide '+curPg);
   document.getElementById('ext-box').style.display='block';
-  document.getElementById('ext-txt').textContent=ext||'…';
+  document.getElementById('ext-txt').textContent=speech||'…';
   setStatus('teaching','🔊 Teaching…');
-  speakText(slideLines[i].txt+'. '+ext,()=>{
+  // Speak ONLY the teacher's explanation — not the raw slide text.
+  // The student can read the slide. The trainer EXPLAINS it.
+  const toSpeak=cleanForSpeech(speech);
+  speakText(toSpeak,()=>{
     slideLines[i].st='taught';lineIdx=i+1;
     if(lineTeaching)setTimeout(()=>teachLine(i+1),600);
   });
 }
 function scrollToLine(i){const items=document.querySelectorAll('.lineitem');if(items[i])items[i].scrollIntoView({behavior:'smooth',block:'nearest'});}
+
+// Clean text for speech synthesis — remove numbers, bullets, avoid robotic reading
+function cleanForSpeech(txt){
+  if(!txt)return'';
+  return txt
+    .replace(/^\s*\d+[\.\)]\s*/,'')   // remove "1. " "2) "
+    .replace(/^[-*•·▸►▪]\s*/,'')      // remove bullet chars
+    .replace(/\[\d+\]/g,'')            // remove [1] citations
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+// Detect if a line is just a heading/title (should be shown but not explained)
+function isHeadingLine(txt){
+  const t=txt.trim();
+  // Short all-caps, or ends with colon, or very short (likely a header)
+  if(t.length<4)return true;
+  if(t===t.toUpperCase()&&t.length<50)return true;
+  if(t.endsWith(':')&&t.split(' ').length<=5)return true;
+  if(/^(introduction|overview|agenda|objectives?|summary|conclusion|background|context)$/i.test(t))return true;
+  return false;
+}
 function updateLPDots(){
   const el=document.getElementById('lpdots');
   const total=slideLines.length;
@@ -1265,7 +1378,7 @@ function renderNotes(){
     if(n.points&&n.points.length){
       n.points.forEach(p=>{
         h+=`<div class="note-point"><div class="note-line">${esc(p.line)}</div>`;
-        if(p.ext&&p.ext.length>5)h+=`<div class="note-ext">${esc(p.ext)}</div>`;
+        const noteExt=p.speech||p.ext||''; if(noteExt.length>5)h+=`<div class="note-ext">${esc(noteExt)}</div>`;
         h+='</div>';
       });
     }else if(n.fullExpl){h+=`<p style="font-size:.77rem;line-height:1.6;color:var(--text)">${esc(n.fullExpl.substring(0,350))}${n.fullExpl.length>350?'…':''}</p>`;}
