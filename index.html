@@ -528,8 +528,7 @@ let trainMode=false,teachMode='line';
 let slideLines=[],lineIdx=0,lineTeach=false;
 let elKey='',elVoiceId='',elVoiceName='',useEL=false;
 let activeTab='trainer';
-const OPENERS=['Think of it this way —','In practice,','Here\'s the real insight:','A concrete example:','What this means for you:','In real life,','The key thing here is','Picture this:','Simply put,','What most people miss:','Consider this:','Here\'s why it matters:'];
-let opIdx=0;
+let opIdx=0; // unused — kept for compatibility
 
 // ── DOMContentLoaded ──
 document.addEventListener('DOMContentLoaded',()=>{
@@ -725,30 +724,35 @@ async function enrichSlide(n,s){
   const img=imgCache[n]||s.image;
   const rawLines=(s.content||'').split('\n').map(l=>l.replace(/^[-*•#>\d\.]+\s*/,'').trim()).filter(l=>l.length>4&&l!==s.title).slice(0,12);
   const lineList=rawLines.map((l,i)=>`${i+1}. ${l}`).join('\n');
-  const instr=`You are a skilled classroom teacher. The student can SEE the slide — your job is to explain each point so it becomes meaningful.
-
-For EACH numbered line, write exactly what you would say aloud to a student wondering "so what?" or "why does this matter?"
-
-Rules:
-- Be SPECIFIC to that line's actual content — no generic statements
-- Add WHY it matters, HOW it works, or give a real-life example
-- 2-3 natural spoken sentences per point
-- Vary your openers — never start two points the same way
-- NEVER say "This point", "This means", "This refers to", "This is about"
-- NEVER say generic things like "this is one of the building blocks" or "this will improve how you approach"
-- Sound like a real, engaged human teacher
+  const instr=`You are a classroom teacher. Below are numbered lines from a training slide. For each line, write 2 sentences of what you would say to a student to explain THAT SPECIFIC line.
 
 Lines to explain:
 ${lineList}
 
-Return ONLY valid JSON (no markdown):
-{"title":"slide title","points":[{"n":1,"line":"line 1 text","speech":"what teacher says for line 1"},{"n":2,"line":"line 2 text","speech":"what teacher says for line 2"},...]}`;
+STRICT RULES — violating these means a failed response:
+1. Each "speech" must be about the SPECIFIC words in that line — if a student hears it without reading the line, they would NOT know what point is being explained (which means you failed)
+2. Never write anything that could apply to ANY other point — it must be uniquely about THIS line
+3. Never use: "This means", "This refers to", "This is about", "This point", "This concept"
+4. Never write filler like "this is important", "this builds on", "this is a key concept", "this will help you", "understanding this deeply"
+5. If the line is too vague to explain specifically, set speech to "" (empty string) — silence is better than nonsense
+6. Start each speech differently — no repeated openers across points
+
+GOOD example — line: "TCP uses a three-way handshake"
+speech: "Before any data transfers, the sender and receiver exchange three messages to confirm they can hear each other — SYN, SYN-ACK, ACK. Without this, you could start sending a 1GB file to a server that went offline 10 seconds ago."
+
+BAD example — line: "TCP uses a three-way handshake"
+speech: "This is an important concept that will help you understand networking better and apply it in real situations."
+
+Return ONLY valid JSON:
+{"title":"slide topic","points":[{"n":1,"line":"line 1 text","speech":"2 sentences specific to line 1, or empty string"},{"n":2,"line":"line 2 text","speech":"2 sentences specific to line 2, or empty string"},...]}`;
 
   let uc;
   if(img){uc=[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},{type:'text',text:'Here is the slide image and the extracted lines:\n\n'+instr}];}
   else{uc=[{type:'text',text:'Slide title: '+s.title+'\n\n'+instr}];}
 
-  const raw=await callClaude([{role:'user',content:uc}],'Return ONLY valid JSON. Each "speech" must be specific to its line — no generic phrases.',1800);
+  const raw=await callClaude([{role:'user',content:uc}],
+    'Return ONLY valid JSON. Each speech must be uniquely specific to its line — a student should be able to identify which line is being explained just from the speech. Empty string is allowed if a line is too vague to explain specifically. Never write generic filler.',
+    1800);
 
   let obj=null;
   for(const parse of[()=>JSON.parse(raw),()=>JSON.parse(raw.replace(/```json|```/gi,'').trim()),()=>{const m=raw.match(/\{[\s\S]*\}/);return m?JSON.parse(m[0]):null;},()=>{const lM=[...raw.matchAll(/"line"\s*:\s*"([^"]+)"/g)];const sM=[...raw.matchAll(/"speech"\s*:\s*"([^"]+)"/g)];const pts=lM.map((m,i)=>({line:m[1],speech:sM[i]?.[1]||''}));const tM=raw.match(/"title"\s*:\s*"([^"]+)"/);return pts.length?{title:tM?.[1]||s.title,points:pts}:null;}]){
@@ -778,20 +782,27 @@ Return ONLY valid JSON (no markdown):
 async function getExt(n,lineText,slideTitle){
   const key=n+'::'+lineText;
   if(extCache[key]?.length>10){ensureNote(n,slideTitle,lineText,extCache[key]);return extCache[key];}
-  // Cache miss — targeted single call for this specific line
+
+  // Cache miss — enrichSlide ran but didn't return speech for this line.
+  // Do a single targeted Claude call for this specific line.
   setSt('thinking','✦ Explaining…');
   const img=imgCache[n]||slides[n-1]?.image;
+  const ctx=slideTitle||slides[n-1]?.title||'';
   try{
-    let uc;
-    const q=`Explain this specific point to a student in 2-3 spoken sentences:\n"${lineText}"\n\nContext: slide about "${slideTitle||slides[n-1]?.title||''}"\n\nTell them WHY it matters and give a concrete real-world example. Do NOT repeat the point. Do NOT say "This means", "This refers to". Be specific and direct.`;
-    if(img)uc=[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},{type:'text',text:q}];
-    else uc=[{type:'text',text:q}];
-    const sp=await callClaude([{role:'user',content:uc}],'Teacher giving 2-3 spoken sentences. Specific to the given point. No generic phrases.',400);
-    extCache[key]=sp;ensureNote(n,slideTitle,lineText,sp);return sp;
+    const q=img
+      ?[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img}},
+        {type:'text',text:`Slide topic: "${ctx}"\n\nExplain this specific point in 2-3 spoken sentences as a teacher:\n"${lineText}"\n\nAdd WHY it matters and give a real-world example from the context of this slide. Be specific to these exact words. Do NOT say "This means" or "This refers to".`}]
+      :[{type:'text',text:`Topic: "${ctx}". Explain this in 2-3 teacher sentences:\n"${lineText}"\n\nWhy does it matter? Give a real example. Be specific to this exact point.`}];
+    const sp=await callClaude([{role:'user',content:q}],'Classroom teacher. 2-3 specific spoken sentences about the exact point given. No generic filler. No "This means" or "This refers to".',400);
+    extCache[key]=sp;
+    ensureNote(n,slideTitle,lineText,sp);
+    return sp;
   }catch(e){
-    const clean=lineText.replace(/^[-*•#\d\.]+\s*/,'').trim();
-    const fb=OPENERS[opIdx++%OPENERS.length]+` understanding "${clean}" deeply will help you apply it correctly in real situations — and that practical application is exactly what this training is building toward.`;
-    extCache[key]=fb;ensureNote(n,slideTitle,lineText,fb);return fb;
+    // If Claude call fails — return empty string.
+    // teachLine will fall back to speaking just the clean line text itself,
+    // which is ALWAYS better than a generic meaningless phrase.
+    extCache[key]='';
+    return '';
   }
 }
 
@@ -901,10 +912,20 @@ async function teachLine(i){
   document.getElementById('tsub').textContent='Point '+(i+1)+' of '+slideLines.length;
   setSt('thinking','✦ Explaining…');
   const sp=await getExt(curPg,slideLines[i].txt,lineCache[curPg]?.title||slides[curPg-1]?.title||'');
-  document.getElementById('ext-box').style.display='block';
-  document.getElementById('exttxt').textContent=sp;
-  setSt('teaching','🔊 Teaching…');
-  speak(cleanSpeech(sp),()=>{slideLines[i].st='taught';lineIdx=i+1;if(lineTeach)setTimeout(()=>teachLine(i+1),500);});
+
+  // If we got a real explanation — show and speak it
+  // If empty — just speak the clean line itself (always better than generic filler)
+  if(sp&&sp.length>10){
+    document.getElementById('ext-box').style.display='block';
+    document.getElementById('exttxt').textContent=sp;
+    setSt('teaching','🔊 Teaching…');
+    speak(cleanSpeech(sp),()=>{slideLines[i].st='taught';lineIdx=i+1;if(lineTeach)setTimeout(()=>teachLine(i+1),500);});
+  }else{
+    // No explanation — speak just the line text clearly
+    document.getElementById('ext-box').style.display='none';
+    setSt('teaching','🔊 Reading…');
+    speak(cleanSpeech(slideLines[i].txt),()=>{slideLines[i].st='taught';lineIdx=i+1;if(lineTeach)setTimeout(()=>teachLine(i+1),400);});
+  }
 }
 
 function scrollToLine(i){const items=document.querySelectorAll('.li');if(items[i])items[i].scrollIntoView({behavior:'smooth',block:'nearest'});}
